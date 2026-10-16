@@ -578,12 +578,38 @@ async function persistTopology(payload) {
   return json;
 }
 
+function decodeTopoBytes(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return new TextDecoder("utf-16le").decode(bytes);
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return new TextDecoder("utf-16be").decode(bytes);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    try {
+      return new TextDecoder("gbk").decode(bytes);
+    } catch (fallbackError) {
+      return new TextDecoder("utf-8").decode(bytes);
+    }
+  }
+}
+
 function readFileAsText(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onload = () => {
+      try {
+        const result = reader.result;
+        resolve(typeof result === "string" ? result : decodeTopoBytes(result));
+      } catch (error) {
+        reject(error);
+      }
+    };
     reader.onerror = () => reject(reader.error || new Error("文件读取失败"));
-    reader.readAsText(file, "utf-8");
+    reader.readAsArrayBuffer(file);
   });
 }
 
@@ -596,7 +622,11 @@ function parseTopo(xmlText) {
     };
   }
 
-  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+  const normalized = xmlText.replace(
+    /^<\?xml[^?]*\?>/,
+    '<?xml version="1.0" encoding="utf-8" ?>'
+  );
+  const doc = new DOMParser().parseFromString(normalized, "text/xml");
   const parserError = doc.querySelector("parsererror");
   if (parserError) throw new Error("TOPO 解析失败，请确认文件格式是否正确");
 
@@ -615,9 +645,21 @@ function parseTopo(xmlText) {
   });
 
   doc.querySelectorAll("lines > line").forEach((node) => {
-    links.push({
-      srcId: node.getAttribute("srcDeviceID") || "",
-      dstId: node.getAttribute("destDeviceID") || "",
+    const srcId = node.getAttribute("srcDeviceID") || "";
+    const dstId = node.getAttribute("destDeviceID") || "";
+    const pairs = node.querySelectorAll("interfacePair");
+    if (pairs.length === 0) {
+      links.push({ srcId, dstId });
+      return;
+    }
+    pairs.forEach((pair) => {
+      links.push({
+        srcId,
+        dstId,
+        lineName: pair.getAttribute("lineName") || "",
+        srcIndex: pair.getAttribute("srcIndex") || "",
+        tarIndex: pair.getAttribute("tarIndex") || "",
+      });
     });
   });
 

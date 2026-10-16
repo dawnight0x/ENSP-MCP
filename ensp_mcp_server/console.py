@@ -29,7 +29,12 @@ _ANSI_CSI_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(rb"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 _IAC = 0xFF
 _CLI_ERROR_RE = re.compile(r"^\s*(?:Error\s*:|错误\s*[:：])", re.IGNORECASE | re.MULTILINE)
-_SAVE_CONFIRM_RE = re.compile(r"(?:\[\s*y\s*/\s*n\s*\]|\(\s*y\s*/\s*n\s*\))\s*[:：]?\s*$", re.IGNORECASE)
+_SAVE_CONFIRM_RE = re.compile(
+    r"(?:\[\s*y\s*/\s*n\s*\]|\(\s*y\s*/\s*n\s*\))"
+    r"(?:\s*\[\s*[ynYN]\s*\])?"
+    r"\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
 _SAVE_FILENAME_RE = re.compile(
     r"(?:input|enter|输入)[^\r\n]*(?:file\s*name|filename|文件名)[^\r\n]*"
     r"\[[^\[\]\r\n]+\.(?:cfg|zip)\]\s*[:：]?\s*$", re.IGNORECASE
@@ -38,6 +43,7 @@ _SAVE_SUCCESS_RE = re.compile(
     r"^\s*(?:Info\s*:\s*)?(?:"
     r"Save\s+(?:the\s+)?(?:current\s+)?configuration\s+successfully[.!]?"
     r"|(?:The\s+)?(?:current\s+)?configuration\s+(?:was\s+|has\s+been\s+)?saved\s+(?:to\s+the\s+device\s+)?successfully[.!]?"
+    r"|Configuration\s+file\s+had\s+been\s+saved\s+successfully[.!]?"
     r"|Successfully\s+saved\s+(?:the\s+)?(?:current\s+)?configuration[.!]?"
     r"|配置(?:文件)?保存成功[。.!]?"
     r")\s*$", re.IGNORECASE | re.MULTILINE
@@ -315,7 +321,9 @@ class HuaweiConsole:
         if not self._sock:
             raise RuntimeError("Socket not connected")
         publish("command_send", device=self.device_label, text=text, payload={"command": text})
-        self._sock.sendall((text + "\r\n").encode("utf-8"))
+        # VRP treats CR as the command terminator. Sending LF as well can be
+        # consumed by an interactive save prompt before we can answer it.
+        self._sock.sendall((text + "\r").encode("utf-8"))
         sysname = _SYSNAME_RE.fullmatch(text.strip())
         if sysname is not None:
             self._pending_prompt = sysname.group(1)

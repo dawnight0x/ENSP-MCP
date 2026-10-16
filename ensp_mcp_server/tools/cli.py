@@ -128,7 +128,9 @@ def ping_from_device(
 ) -> str:
     """从设备发起 Ping 测试"""
     try:
-        command = f"ping -c {count} -t 2"
+        # VRP's -t timeout is in milliseconds; 2 would be too short for
+        # ordinary eNSP links and makes healthy targets look unreachable.
+        command = f"ping -c {count} -t 2000"
         if source_ip:
             command += f" -a {source_ip}"
         command += f" {target_ip}"
