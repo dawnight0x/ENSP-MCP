@@ -106,7 +106,7 @@ claude mcp add --transport stdio ensp-mcp -- uv --directory "<项目根目录>" 
 
 有三种方式：
 
-**自动发现：** 让 AI 执行 `auto_discover`。它查找 `eNSP_Client.exe` 进程及其 2000–2999 范围的本地控制台监听端口，合并设备注册信息。它不会发现没有控制台端口的终端设备。
+**自动发现：** 让 AI 执行 `auto_discover`。它首先查找 `eNSP_Client.exe` 进程及其 2000–2999 范围的本地控制台监听端口；如果进程枚举或端口关联不可用，则回退到当前网页上传拓扑生成的 `topology.json`，逐个 TCP 探测其中的 `com_port`。发现结果会合并到设备注册表，并保留拓扑中的设备名称。没有控制台端口的终端设备仍不会被发现。
 
 **手动注册：** 在 eNSP 中右键设备 > 设置 > 查看串口号，然后让 AI 执行：
 

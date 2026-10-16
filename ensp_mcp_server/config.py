@@ -18,6 +18,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from .exceptions import DeviceNotFoundError, ToolFailure
+from .topology_context import load_current_topology
 from .validation import validate_name, validate_port, validate_topology_devices, validate_topology_payload
 
 # ==================== 日志配置 ====================
@@ -494,62 +495,133 @@ def _decode_console_bytes(raw: bytes | None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _topology_console_candidates() -> dict[int, str]:
+    """Return non-zero console ports from the current uploaded topology.
+
+    The web UI stores the parsed ``.topo`` inventory in ``topology.json``.
+    Keeping this fallback limited to that current snapshot avoids guessing
+    which arbitrary local topology file should be used by auto discovery.
+    """
+    try:
+        payload = load_current_topology()
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("devices"), list):
+        return {}
+
+    candidates: dict[int, str] = {}
+    for item in payload["devices"]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        raw_port = item.get("comPort", item.get("port"))
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if isinstance(raw_port, str) and raw_port.strip().isdigit():
+            raw_port = int(raw_port.strip())
+        if type(raw_port) is not int or not 1 <= raw_port <= 65535:
+            # Port 0 is a valid topology value for PC/Client/Server, but it
+            # deliberately has no console to probe.
+            continue
+        candidates.setdefault(raw_port, name.strip())
+    return candidates
+
+
+def _probe_console_port(port: int, timeout: float = 2.0) -> bool:
+    """Check whether a local eNSP console port accepts a TCP connection."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _discover_from_topology_ports() -> tuple[set[int], dict[int, str]]:
+    """Probe current topology ``com_port`` values as discovery fallback."""
+    candidates = _topology_console_candidates()
+    reachable = {
+        port: name
+        for port, name in candidates.items()
+        if _probe_console_port(port)
+    }
+    return set(reachable), reachable
+
+
 def auto_discover_devices() -> str:
     """
     自动发现 eNSP 设备：
-    1. 查找 eNSP_Client.exe 进程 PID
-    2. 获取监听的 TCP 端口（2000-2999）
-    3. 连接获取 sysname
-    4. 合并更新注册表（保留手动注册的设备）
+    1. 优先通过 eNSP_Client.exe + netstat 获取监听端口
+    2. 进程枚举不可用时，回退到当前拓扑的 com_port 逐个 TCP 探测
+    3. 连接获取 sysname 并合并更新注册表（保留手动注册的设备）
     """
+    fallback_aliases: dict[int, str] = {}
+    discovery_source = "tasklist/netstat"
+
+    def use_topology_fallback(reason: str) -> tuple[set[int], str | None]:
+        nonlocal fallback_aliases, discovery_source
+        fallback_ports, fallback_aliases = _discover_from_topology_ports()
+        discovery_source = "topology com_port TCP fallback"
+        if not fallback_ports:
+            return set(), reason
+        return fallback_ports, None
+
     # 1. 查找 eNSP 进程 PID
     try:
         result = subprocess.run(
             ['tasklist'], capture_output=True, timeout=10
         )
     except Exception as e:
-        return ToolFailure(f"无法获取进程列表: {e}")
-    if result.returncode:
-        return ToolFailure(f"无法获取进程列表 (exit {result.returncode}): {_decode_console_bytes(result.stderr).strip()}")
+        port_set, fallback_error = use_topology_fallback(f"无法获取进程列表: {e}")
+        pids: set[str] = set()
+    else:
+        pids = set()
+        if result.returncode == 0:
+            for line in _decode_console_bytes(result.stdout).split('\n'):
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].lower() == 'ensp_client.exe' and parts[1].isdigit():
+                    pids.add(parts[1])
+        if not pids:
+            port_set, fallback_error = use_topology_fallback(
+                "未检测到 eNSP_Client.exe 进程，也没有可用的当前拓扑 com_port TCP 端口。"
+            )
+        else:
+            # 2. 获取控制台端口
+            try:
+                result = subprocess.run(
+                    ['netstat', '-ano'], capture_output=True, timeout=10
+                )
+            except Exception as e:
+                port_set, fallback_error = use_topology_fallback(f"无法获取端口信息: {e}")
+            else:
+                if result.returncode:
+                    port_set, fallback_error = use_topology_fallback(
+                        f"无法获取端口信息 (exit {result.returncode}): "
+                        f"{_decode_console_bytes(result.stderr).strip()}"
+                    )
+                else:
+                    port_set = set()
+                    for line in _decode_console_bytes(result.stdout).split('\n'):
+                        parts = line.split()
+                        if len(parts) != 5 or parts[0].upper() != 'TCP' or parts[3].upper() != 'LISTENING':
+                            continue
+                        if parts[4] not in pids:
+                            continue
+                        match = re.fullmatch(r'(?:0\.0\.0\.0|127\.0\.0\.1):([0-9]+)', parts[1])
+                        if match:
+                            port = int(match.group(1))
+                            if 2000 <= port <= 2999:
+                                port_set.add(port)
+                    if not port_set:
+                        port_set, fallback_error = use_topology_fallback(
+                            f"找到 eNSP 进程 (PID: {', '.join(sorted(pids))})，但未检测到控制台端口；"
+                            "当前拓扑 com_port TCP 探测也没有发现可用端口。"
+                        )
+                    else:
+                        fallback_error = None
 
-    pids = set()
-    for line in _decode_console_bytes(result.stdout).split('\n'):
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].lower() == 'ensp_client.exe' and parts[1].isdigit():
-            pids.add(parts[1])
-
-    if not pids:
-        return ToolFailure("未检测到 eNSP_Client.exe 进程，请确认 eNSP 已启动且设备已运行。")
-
-    # 2. 获取控制台端口
-    try:
-        result = subprocess.run(
-            ['netstat', '-ano'], capture_output=True, timeout=10
-        )
-    except Exception as e:
-        return ToolFailure(f"无法获取端口信息: {e}")
-    if result.returncode:
-        return ToolFailure(f"无法获取端口信息 (exit {result.returncode}): {_decode_console_bytes(result.stderr).strip()}")
-
-    port_set = set()
-    for line in _decode_console_bytes(result.stdout).split('\n'):
-        parts = line.split()
-        if len(parts) != 5 or parts[0].upper() != 'TCP' or parts[3].upper() != 'LISTENING':
-            continue
-        if parts[4] not in pids:
-            continue
-        match = re.fullmatch(r'(?:0\.0\.0\.0|127\.0\.0\.1):([0-9]+)', parts[1])
-        if match:
-            port = int(match.group(1))
-            if 2000 <= port <= 2999:
-                port_set.add(port)
+    if not port_set:
+        return ToolFailure(fallback_error or "未检测到可用的 eNSP 控制台端口。")
     ports = sorted(port_set)
-
-    if not ports:
-        return ToolFailure(
-            f"找到 eNSP 进程 (PID: {', '.join(pids)})，"
-            "但未检测到控制台端口（2000-2999 范围）。请确认设备已启动。"
-        )
 
     # Preserve manual/topology aliases and metadata. Only replace discovered
     # entries previously owned by auto_discover at these ports.
@@ -569,6 +641,8 @@ def auto_discover_devices() -> str:
         sysname = _get_sysname_from_port(port)
         if port in existing_names:
             name = existing_names[port]
+        elif port in fallback_aliases:
+            name = fallback_aliases[port]
         elif sysname and sysname != "Huawei":
             name = sysname
         else:
@@ -593,7 +667,7 @@ def auto_discover_devices() -> str:
     _save_registry()
 
     # 生成报告
-    lines = [f"自动发现完成！共找到 {len(discovered)} 台设备:"]
+    lines = [f"自动发现完成！共找到 {len(discovered)} 台设备:", f"发现方式: {discovery_source}"]
     lines.append(f"{'设备名':<12} {'端口':<8}")
     lines.append("-" * 20)
     for name, port in discovered.items():
